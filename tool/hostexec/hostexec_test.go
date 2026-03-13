@@ -10,9 +10,12 @@
 package hostexec
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -455,6 +458,365 @@ func TestSessionKill_IgnoresProcessDone(t *testing.T) {
 	sess.cancel = cancel
 
 	require.NoError(t, sess.kill(context.Background(), 0))
+}
+
+func TestToolSet_MetadataAndOptions(t *testing.T) {
+	baseDir := t.TempDir()
+	baseEnv := map[string]string{
+		"HOSTEXEC_ONE": "1",
+		" ":            "skip",
+	}
+
+	set, err := NewToolSet(
+		WithBaseDir(baseDir),
+		WithName(" custom-tool "),
+		WithMaxLines(7),
+		WithJobTTL(time.Second),
+		WithBaseEnv(baseEnv),
+	)
+	require.NoError(t, err)
+	defer set.Close()
+
+	typed := set.(*toolSet)
+	require.Equal(t, "custom-tool", typed.Name())
+	require.Len(t, typed.Tools(context.Background()), 3)
+	require.Equal(t, 7, typed.mgr.maxLines)
+	require.Equal(t, time.Second, typed.mgr.jobTTL)
+	require.Equal(
+		t,
+		map[string]string{"HOSTEXEC_ONE": "1"},
+		typed.mgr.baseEnv,
+	)
+
+	baseEnv["HOSTEXEC_ONE"] = "2"
+	require.Equal(t, "1", typed.mgr.baseEnv["HOSTEXEC_ONE"])
+
+	blank, err := NewToolSet(WithName("   "))
+	require.NoError(t, err)
+	defer blank.Close()
+	require.Equal(t, defaultToolSetName, blank.(*toolSet).Name())
+
+	var nilSet *toolSet
+	require.NoError(t, nilSet.Close())
+}
+
+func TestToolCalls_NotConfigured(t *testing.T) {
+	var execTool *execCommandTool
+	_, err := execTool.Call(
+		context.Background(),
+		mustJSON(t, map[string]any{"command": "echo hi"}),
+	)
+	require.EqualError(t, err, errExecToolNotConfigured)
+
+	var writeTool *writeStdinTool
+	_, err = writeTool.Call(
+		context.Background(),
+		mustJSON(t, map[string]any{"session_id": "x"}),
+	)
+	require.EqualError(t, err, errWriteToolNotConfigured)
+
+	var killTool *killSessionTool
+	require.Equal(
+		t,
+		toolKillSession,
+		killTool.Declaration().Name,
+	)
+	_, err = killTool.Call(
+		context.Background(),
+		mustJSON(t, map[string]any{"session_id": "x"}),
+	)
+	require.EqualError(t, err, errKillToolNotConfigured)
+}
+
+func TestWriteStdin_CanceledBeforePoll(t *testing.T) {
+	mgr := newManager()
+	sess := newSession("session", "cat", defaultMaxLines)
+	sess.stdin = &testWriteCloser{}
+	mgr.sessions[sess.id] = sess
+
+	tool := &writeStdinTool{mgr: mgr}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := tool.Call(
+		ctx,
+		mustJSON(t, map[string]any{
+			"sessionId": "session",
+			"chars":     "hello",
+			"yieldMs":   1,
+			"submit":    true,
+		}),
+	)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestHostexec_HelperFunctions(t *testing.T) {
+	updated := setEnv([]string{"HOSTEXEC_A=1"}, "HOSTEXEC_A", "2")
+	require.Equal(t, []string{"HOSTEXEC_A=2"}, updated)
+
+	env := mergedEnv(
+		map[string]string{"HOSTEXEC_A": "base"},
+		map[string]string{"HOSTEXEC_A": "extra", "HOSTEXEC_B": "2"},
+	)
+	require.Contains(t, env, "HOSTEXEC_A=extra")
+	require.Contains(t, env, "HOSTEXEC_B=2")
+
+	require.Equal(t, 0, exitCode(nil))
+	require.Equal(t, -1, exitCode(errors.New("boom")))
+
+	cmd := exec.Command("sh", "-c", "exit 7")
+	err := cmd.Run()
+	require.Equal(t, 7, exitCode(err))
+
+	require.Equal(
+		t,
+		time.Duration(defaultTimeoutS)*time.Second,
+		timeoutDuration(0),
+	)
+	require.Equal(
+		t,
+		time.Duration(maxTimeoutSeconds)*time.Second,
+		timeoutDuration(int(maxTimeoutSeconds)+1),
+	)
+
+	require.Nil(t, firstInt())
+	first := 1
+	second := 2
+	require.Same(t, &first, firstInt(nil, &first, &second))
+
+	require.False(t, firstBool())
+	no := false
+	yes := true
+	require.False(t, firstBool(nil, &no, &yes))
+	require.True(t, firstBool(nil, &yes))
+
+	require.Equal(t, "", firstNonEmpty(" ", "\t"))
+
+	baseDir, err := resolveBaseDir("")
+	require.NoError(t, err)
+	require.Equal(t, "", baseDir)
+
+	cloned := cloneEnvMap(map[string]string{
+		"HOSTEXEC_A": "1",
+		" ":          "skip",
+	})
+	require.Equal(t, map[string]string{"HOSTEXEC_A": "1"}, cloned)
+}
+
+func TestShellSpec_ErrorWhenShellMissing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell lookup differs on windows")
+	}
+
+	t.Setenv("PATH", "")
+	_, _, err := shellSpec()
+	require.ErrorContains(t, err, "bash or sh is required")
+}
+
+func TestManager_HelperBranches(t *testing.T) {
+	mgr := newManager()
+
+	_, err := mgr.poll("missing", nil)
+	require.ErrorIs(t, err, errUnknownSession)
+	require.ErrorIs(
+		t,
+		mgr.write("missing", "x", false),
+		errUnknownSession,
+	)
+	require.ErrorIs(
+		t,
+		mgr.killContext(context.Background(), "missing"),
+		errUnknownSession,
+	)
+
+	running := newSession("running", "sleep", defaultMaxLines)
+	mgr.sessions[running.id] = running
+	require.EqualError(
+		t,
+		mgr.clearFinished(running.id),
+		"session is still running",
+	)
+
+	now := time.Now()
+	oldDone := newSession("old", "done", defaultMaxLines)
+	oldDone.finished = now.Add(-2 * time.Hour)
+	recentDone := newSession("recent", "done", defaultMaxLines)
+	recentDone.finished = now
+	mgr.sessions[oldDone.id] = oldDone
+	mgr.sessions[recentDone.id] = recentDone
+	mgr.jobTTL = time.Minute
+	mgr.clock = func() time.Time { return now }
+	mgr.cleanupExpired()
+	require.NotContains(t, mgr.sessions, oldDone.id)
+	require.Contains(t, mgr.sessions, recentDone.id)
+	require.Contains(t, mgr.sessions, running.id)
+
+	waitDone(nil, time.Millisecond)
+	waitDone(make(chan struct{}), 0)
+	done := make(chan struct{})
+	close(done)
+	waitDone(done, time.Second)
+}
+
+func TestManager_ExecValidationAndStartErrors(t *testing.T) {
+	mgr := newManager()
+
+	_, err := mgr.exec(nil, execParams{Command: "echo hi"})
+	require.EqualError(t, err, "nil context")
+
+	_, err = mgr.exec(context.Background(), execParams{})
+	require.EqualError(t, err, errCommandRequired)
+
+	if _, _, err := shellSpec(); err != nil {
+		t.Skip(err.Error())
+	}
+
+	_, err = mgr.startBackground(
+		execParams{
+			Command: "echo hi",
+			Workdir: filepath.Join(t.TempDir(), "missing"),
+		},
+		time.Second,
+	)
+	require.Error(t, err)
+
+	yield := 200
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = mgr.exec(
+		ctx,
+		execParams{
+			Command: "sleep 5",
+			YieldMs: &yield,
+		},
+	)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestSession_HelpersAndBranches(t *testing.T) {
+	sess := newSession("s", "cmd", 1)
+	require.True(t, sess.doneAt().IsZero())
+
+	sess.appendOutput("first\nsecond")
+	sess.appendOutput("\nthird\n")
+	require.Equal(t, 2, sess.lineBase)
+	require.Equal(t, []string{"third"}, sess.lines)
+
+	sess.pollCursor = 0
+	limit := 1
+	poll := sess.poll(&limit)
+	require.Equal(t, 2, poll.Offset)
+	require.Equal(t, 3, poll.NextOffset)
+	require.Equal(t, "third", poll.Output)
+
+	require.Equal(t, "", sess.tail(0))
+	require.Equal(t, "third", sess.tail(1))
+
+	sess.partial = "tail"
+	require.Equal(t, "tail", trimOutputTail("head\ntail", 1))
+	require.Equal(t, "", trimOutputTail("", 1))
+	require.Equal(t, "", trimOutputTail("head", 0))
+
+	sess.markDone(7)
+	doneAt := sess.doneAt()
+	require.False(t, doneAt.IsZero())
+	sess.markDone(9)
+
+	out, code := sess.allOutput()
+	require.Equal(t, "third\ntail", out)
+	require.Equal(t, 7, code)
+
+	exited := sess.poll(nil)
+	require.Equal(t, programStatusExited, exited.Status)
+	require.NotNil(t, exited.ExitCode)
+	require.Equal(t, 7, *exited.ExitCode)
+}
+
+func TestSession_WriteAndCloseBranches(t *testing.T) {
+	sess := newSession("write", "cmd", defaultMaxLines)
+	writer := &testWriteCloser{}
+	sess.stdin = writer
+
+	require.NoError(t, sess.write("", false))
+	require.NoError(t, sess.write("hello", false))
+	require.Equal(t, "hello", writer.String())
+
+	noStdin := newSession("no-stdin", "cmd", defaultMaxLines)
+	require.EqualError(
+		t,
+		noStdin.write("hello", false),
+		"stdin is not available",
+	)
+
+	stopped := newSession("stopped", "cmd", defaultMaxLines)
+	stopped.stdin = &testWriteCloser{}
+	stopped.finished = time.Now()
+	require.EqualError(
+		t,
+		stopped.write("hello", false),
+		"session is not running",
+	)
+
+	closeErr := errors.New("close failed")
+	count := 0
+	closer := newSession("close", "cmd", defaultMaxLines)
+	closer.closeIO = func() error {
+		count++
+		return closeErr
+	}
+	require.ErrorIs(t, closer.close(), closeErr)
+	require.NoError(t, closer.close())
+	require.Equal(t, 1, count)
+}
+
+func TestSession_KillBranches(t *testing.T) {
+	sess := newSession("nil", "cmd", defaultMaxLines)
+	canceled := false
+	sess.cancel = func() { canceled = true }
+	require.NoError(t, sess.kill(context.Background(), -1))
+	require.True(t, canceled)
+
+	if _, _, err := shellSpec(); err != nil {
+		t.Skip(err.Error())
+	}
+
+	cmd, err := shellCmd(context.Background(), "sleep 5")
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	killSess := newSession("kill", "sleep 5", defaultMaxLines)
+	killSess.cmd = cmd
+	require.NoError(t, killSess.kill(ctx, -1))
+	_, err = cmd.Process.Wait()
+	require.NoError(t, err)
+}
+
+func TestStartPTY_ErrorBranches(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty is not supported on windows")
+	}
+
+	_, _, err := startPTY(nil)
+	require.EqualError(t, err, "nil command")
+
+	cmd := exec.Command("definitely-missing-binary")
+	_, _, err = startPTY(cmd)
+	require.Error(t, err)
+}
+
+type testWriteCloser struct {
+	bytes.Buffer
+}
+
+func (w *testWriteCloser) Close() error {
+	return nil
 }
 
 func toolSetTools(
