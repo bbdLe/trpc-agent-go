@@ -176,7 +176,7 @@ func TestNewToolSet_WriteStdin_NoRepeatedInitialOutput(t *testing.T) {
 	require.NoError(t, err)
 	defer set.Close()
 
-	execTool, writeTool, _, _ := toolSetTools(t, set)
+	execTool, writeTool, _, mgr := toolSetTools(t, set)
 	out, err := execTool.Call(
 		context.Background(),
 		mustJSON(t, map[string]any{
@@ -189,9 +189,18 @@ func TestNewToolSet_WriteStdin_NoRepeatedInitialOutput(t *testing.T) {
 
 	res := out.(map[string]any)
 	require.Equal(t, programStatusRunning, res["status"])
-	require.Contains(t, outputField(res), "ready")
 	sessionID := res["session_id"].(string)
 	require.NotEmpty(t, sessionID)
+	initial := outputField(res)
+	if !strings.Contains(initial, "ready") {
+		initial += waitForOutputContains(
+			t,
+			mgr,
+			sessionID,
+			"ready",
+		)
+	}
+	require.Contains(t, initial, "ready")
 
 	writeOut, err := writeTool.Call(
 		context.Background(),
@@ -202,8 +211,10 @@ func TestNewToolSet_WriteStdin_NoRepeatedInitialOutput(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
-	require.NotContains(t, outputField(writeOut.(map[string]any)), "ready")
-	require.Contains(t, outputField(writeOut.(map[string]any)), "got:hi")
+	postWrite := outputField(writeOut.(map[string]any))
+	postWrite += pollUntilExited(t, mgr, sessionID)
+	require.NotContains(t, postWrite, "ready")
+	require.Contains(t, postWrite, "got:hi")
 }
 
 func TestNewToolSet_KillSession(t *testing.T) {
@@ -489,6 +500,41 @@ func pollUntilExited(
 		time.Sleep(pollInterval)
 	}
 	t.Fatalf("process did not exit; output: %s", all)
+	return ""
+}
+
+func waitForOutputContains(
+	t *testing.T,
+	mgr *manager,
+	sessionID string,
+	want string,
+) string {
+	t.Helper()
+
+	const (
+		pollDeadline = 2 * time.Second
+		pollInterval = 50 * time.Millisecond
+	)
+	deadline := time.Now().Add(pollDeadline)
+	var all string
+	for time.Now().Before(deadline) {
+		poll, err := mgr.poll(sessionID, nil)
+		require.NoError(t, err)
+		if poll.Output != "" {
+			if all != "" {
+				all += "\n"
+			}
+			all += poll.Output
+			if strings.Contains(all, want) {
+				return all
+			}
+		}
+		if poll.Status == programStatusExited {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+	t.Fatalf("did not observe %q; output: %s", want, all)
 	return ""
 }
 
