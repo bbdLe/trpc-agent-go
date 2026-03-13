@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -257,7 +258,25 @@ func (s *session) write(data string, newline bool) error {
 	return err
 }
 
-func (s *session) kill(grace time.Duration) error {
+func killProcess(process *os.Process) error {
+	if process == nil {
+		return nil
+	}
+	if err := process.Kill(); err != nil &&
+		!errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
+}
+
+func (s *session) kill(
+	ctx context.Context,
+	grace time.Duration,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	s.mu.Lock()
 	cmd := s.cmd
 	cancel := s.cancel
@@ -274,17 +293,28 @@ func (s *session) kill(grace time.Duration) error {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 	}
 
+	if grace < 0 {
+		grace = 0
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
 	select {
 	case <-s.doneCh:
 		if cancel != nil {
 			cancel()
 		}
 		return nil
-	case <-time.After(grace):
+	case <-ctx.Done():
 		if cancel != nil {
 			cancel()
 		}
-		return cmd.Process.Kill()
+		return killProcess(cmd.Process)
+	case <-timer.C:
+		if cancel != nil {
+			cancel()
+		}
+		return killProcess(cmd.Process)
 	}
 }
 

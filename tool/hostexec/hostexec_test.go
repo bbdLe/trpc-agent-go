@@ -204,6 +204,48 @@ func TestNewToolSet_KillSession(t *testing.T) {
 	_ = pollUntilExited(t, mgr, sessionID)
 }
 
+func TestNewToolSet_KillSessionRespectsContext(t *testing.T) {
+	if _, _, err := shellSpec(); err != nil {
+		t.Skip(err.Error())
+	}
+
+	set, err := NewToolSet(WithJobTTL(10 * time.Second))
+	require.NoError(t, err)
+	defer set.Close()
+
+	execTool, _, killTool, mgr := toolSetTools(t, set)
+	out, err := execTool.Call(
+		context.Background(),
+		mustJSON(t, map[string]any{
+			"command":    "sleep 5",
+			"background": true,
+		}),
+	)
+	require.NoError(t, err)
+
+	res := out.(map[string]any)
+	sessionID := res["session_id"].(string)
+	require.NotEmpty(t, sessionID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	started := time.Now()
+	killOut, err := killTool.Call(
+		ctx,
+		mustJSON(t, map[string]any{
+			"session_id": sessionID,
+		}),
+	)
+	require.NoError(t, err)
+	require.Less(t, time.Since(started), time.Second)
+
+	killRes := killOut.(map[string]any)
+	require.Equal(t, true, killRes["ok"])
+	require.Equal(t, sessionID, killRes["session_id"])
+	_ = pollUntilExited(t, mgr, sessionID)
+}
+
 func TestNewToolSet_CloseKillsSessions(t *testing.T) {
 	if _, _, err := shellSpec(); err != nil {
 		t.Skip(err.Error())
@@ -290,6 +332,62 @@ func TestTools_InvalidArgs(t *testing.T) {
 
 	_, err = killTool.Call(context.Background(), []byte("{"))
 	require.Error(t, err)
+}
+
+func TestManager_GetUnknownSession(t *testing.T) {
+	mgr := newManager()
+
+	_, err := mgr.get("missing")
+	require.ErrorIs(t, err, errUnknownSession)
+}
+
+func TestNewToolSet_HugeTimeout(t *testing.T) {
+	if _, _, err := shellSpec(); err != nil {
+		t.Skip(err.Error())
+	}
+
+	set, err := NewToolSet()
+	require.NoError(t, err)
+	defer set.Close()
+
+	execTool, _, _, _ := toolSetTools(t, set)
+	hugeTimeout := int(^uint(0) >> 1)
+	out, err := execTool.Call(
+		context.Background(),
+		mustJSON(t, map[string]any{
+			"command":       "sleep 0.1; echo ok",
+			"yield_time_ms": 0,
+			"timeout_sec":   hugeTimeout,
+		}),
+	)
+	require.NoError(t, err)
+
+	res := out.(map[string]any)
+	require.Equal(t, programStatusExited, res["status"])
+	require.Contains(t, outputField(res), "ok")
+	require.EqualValues(t, 0, res["exit_code"])
+}
+
+func TestSessionKill_IgnoresProcessDone(t *testing.T) {
+	if _, _, err := shellSpec(); err != nil {
+		t.Skip(err.Error())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd, err := shellCmd(ctx, "true")
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+
+	_, err = cmd.Process.Wait()
+	require.NoError(t, err)
+
+	sess := newSession("done", "true", defaultMaxLines)
+	sess.cmd = cmd
+	sess.cancel = cancel
+
+	require.NoError(t, sess.kill(context.Background(), 0))
 }
 
 func toolSetTools(

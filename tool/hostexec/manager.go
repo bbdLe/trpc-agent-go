@@ -23,14 +23,18 @@ import (
 )
 
 const (
-	defaultYieldMS   = 10_000
-	defaultTimeoutS  = 1_800
-	defaultLogTail   = 40
-	defaultMaxLines  = 20_000
-	defaultJobTTL    = 30 * time.Minute
-	defaultKillGrace = 2 * time.Second
-	defaultIODrain   = 1 * time.Second
+	defaultYieldMS    = 10_000
+	defaultTimeoutS   = 1_800
+	defaultLogTail    = 40
+	defaultMaxLines   = 20_000
+	defaultJobTTL     = 30 * time.Minute
+	defaultKillGrace  = 2 * time.Second
+	defaultIODrain    = 1 * time.Second
+	maxTimeoutSeconds = int64((1<<63)-1) /
+		int64(time.Second)
 )
+
+var errUnknownSession = errors.New("unknown session id")
 
 type manager struct {
 	mu       sync.Mutex
@@ -92,7 +96,7 @@ func (m *manager) exec(
 	if params.TimeoutS != nil && *params.TimeoutS > 0 {
 		timeoutS = *params.TimeoutS
 	}
-	timeout := time.Duration(timeoutS) * time.Second
+	timeout := timeoutDuration(timeoutS)
 
 	if !params.Background && yieldMs == 0 && !params.Pty {
 		out, code, err := runForeground(
@@ -184,6 +188,16 @@ func runForeground(
 	return string(output), exitCode(runErr), nil
 }
 
+func timeoutDuration(timeoutS int) time.Duration {
+	if timeoutS <= 0 {
+		timeoutS = defaultTimeoutS
+	}
+	if int64(timeoutS) > maxTimeoutSeconds {
+		timeoutS = int(maxTimeoutSeconds)
+	}
+	return time.Duration(timeoutS) * time.Second
+}
+
 func shellCmd(
 	ctx context.Context,
 	command string,
@@ -192,11 +206,13 @@ func shellCmd(
 	if err != nil {
 		return nil, err
 	}
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command
+	// hostexec intentionally executes trusted host commands.
 	return exec.CommandContext(
 		ctx,
 		shell,
 		append(args, command)...,
-	), nil
+	), nil //nolint:gosec
 }
 
 func shellSpec() (string, []string, error) {
@@ -326,6 +342,9 @@ func (m *manager) startBackground(
 	m.mu.Unlock()
 
 	go func() {
+		// Use cmd.Process.Wait() instead of cmd.Wait() because
+		// cmd.Wait() closes StdoutPipe/StderrPipe readers before
+		// the readFrom goroutines are done consuming those pipes.
 		processState, _ := cmd.Process.Wait()
 		waitDone(sess.ioDone, defaultIODrain)
 		code := -1
@@ -400,11 +419,18 @@ func (m *manager) write(
 }
 
 func (m *manager) kill(id string) error {
+	return m.killContext(context.Background(), id)
+}
+
+func (m *manager) killContext(
+	ctx context.Context,
+	id string,
+) error {
 	sess, err := m.get(id)
 	if err != nil {
 		return err
 	}
-	return sess.kill(defaultKillGrace)
+	return sess.kill(ctx, defaultKillGrace)
 }
 
 func (m *manager) clearFinished(id string) error {
@@ -427,7 +453,7 @@ func (m *manager) get(id string) (*session, error) {
 
 	sess, ok := m.sessions[id]
 	if !ok {
-		return nil, fmt.Errorf("unknown session id: %s", id)
+		return nil, fmt.Errorf("%w: %s", errUnknownSession, id)
 	}
 	return sess, nil
 }
@@ -458,8 +484,13 @@ func (m *manager) close() error {
 
 	var firstErr error
 	for _, id := range ids {
-		if err := m.kill(id); err != nil && firstErr == nil {
-			firstErr = err
+		if err := m.kill(id); err != nil {
+			if errors.Is(err, errUnknownSession) {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 		m.mu.Lock()
 		delete(m.sessions, id)

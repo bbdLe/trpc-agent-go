@@ -463,7 +463,6 @@ func (t *killSessionTool) Call(
 	ctx context.Context,
 	args []byte,
 ) (any, error) {
-	_ = ctx
 	if t == nil || t.mgr == nil {
 		return nil, errors.New(errKillToolNotConfigured)
 	}
@@ -477,7 +476,7 @@ func (t *killSessionTool) Call(
 		return nil, errors.New(errSessionIDRequired)
 	}
 
-	err := t.mgr.kill(sessionID)
+	err := t.mgr.killContext(ctx, sessionID)
 	return map[string]any{
 		"ok":         err == nil,
 		"session_id": sessionID,
