@@ -170,6 +170,22 @@ func (s *session) tail(lines int) string {
 	return out
 }
 
+func trimOutputTail(output string, lines int) string {
+	if lines <= 0 || output == "" {
+		return ""
+	}
+	parts := strings.Split(output, "\n")
+	if len(parts) <= lines {
+		return output
+	}
+	return strings.Join(parts[len(parts)-lines:], "\n")
+}
+
+func (s *session) pollTail(lines int) string {
+	poll := s.poll(nil)
+	return trimOutputTail(poll.Output, lines)
+}
+
 func (s *session) allOutput() (string, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

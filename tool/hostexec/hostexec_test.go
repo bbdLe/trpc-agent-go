@@ -112,7 +112,7 @@ func TestNewToolSet_YieldAndPoll(t *testing.T) {
 		pollInterval = 50 * time.Millisecond
 	)
 	deadline := time.Now().Add(pollDeadline)
-	var all string
+	all := outputField(res)
 	for time.Now().Before(deadline) {
 		poll, err := mgr.poll(sessionID, nil)
 		require.NoError(t, err)
@@ -165,6 +165,45 @@ func TestNewToolSet_WriteStdin(t *testing.T) {
 	all := outputField(writeOut.(map[string]any))
 	all += pollUntilExited(t, mgr, sessionID)
 	require.Contains(t, all, "got:hi")
+}
+
+func TestNewToolSet_WriteStdin_NoRepeatedInitialOutput(t *testing.T) {
+	if _, _, err := shellSpec(); err != nil {
+		t.Skip(err.Error())
+	}
+
+	set, err := NewToolSet(WithJobTTL(10 * time.Second))
+	require.NoError(t, err)
+	defer set.Close()
+
+	execTool, writeTool, _, _ := toolSetTools(t, set)
+	out, err := execTool.Call(
+		context.Background(),
+		mustJSON(t, map[string]any{
+			"command": "printf 'ready\\n'; read -r line; " +
+				"echo got:$line",
+			"yieldMs": 100,
+		}),
+	)
+	require.NoError(t, err)
+
+	res := out.(map[string]any)
+	require.Equal(t, programStatusRunning, res["status"])
+	require.Contains(t, outputField(res), "ready")
+	sessionID := res["session_id"].(string)
+	require.NotEmpty(t, sessionID)
+
+	writeOut, err := writeTool.Call(
+		context.Background(),
+		mustJSON(t, map[string]any{
+			"session_id":     sessionID,
+			"chars":          "hi",
+			"append_newline": true,
+		}),
+	)
+	require.NoError(t, err)
+	require.NotContains(t, outputField(writeOut.(map[string]any)), "ready")
+	require.Contains(t, outputField(writeOut.(map[string]any)), "got:hi")
 }
 
 func TestNewToolSet_KillSession(t *testing.T) {
@@ -332,6 +371,23 @@ func TestTools_InvalidArgs(t *testing.T) {
 
 	_, err = killTool.Call(context.Background(), []byte("{"))
 	require.Error(t, err)
+}
+
+func TestToolDeclarations_UseIntegerDurations(t *testing.T) {
+	set, err := NewToolSet()
+	require.NoError(t, err)
+	defer set.Close()
+
+	execTool, writeTool, _, _ := toolSetTools(t, set)
+	execDecl := execTool.Declaration().InputSchema.Properties
+	require.Equal(t, "integer", execDecl["yield_time_ms"].Type)
+	require.Equal(t, "integer", execDecl["yieldMs"].Type)
+	require.Equal(t, "integer", execDecl["timeout_sec"].Type)
+	require.Equal(t, "integer", execDecl["timeoutSec"].Type)
+
+	writeDecl := writeTool.Declaration().InputSchema.Properties
+	require.Equal(t, "integer", writeDecl["yield_time_ms"].Type)
+	require.Equal(t, "integer", writeDecl["yieldMs"].Type)
 }
 
 func TestManager_GetUnknownSession(t *testing.T) {

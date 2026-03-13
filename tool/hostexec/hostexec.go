@@ -197,7 +197,7 @@ func (t *execCommandTool) Declaration() *tool.Declaration {
 					Description: "Optional environment overrides.",
 				},
 				"yield_time_ms": {
-					Type: "number",
+					Type: "integer",
 					Description: "Wait this long before " +
 						"returning. Use 0 to wait for exit " +
 						"when possible.",
@@ -207,7 +207,7 @@ func (t *execCommandTool) Declaration() *tool.Declaration {
 					Description: "Start the command and return.",
 				},
 				"timeout_sec": {
-					Type:        "number",
+					Type:        "integer",
 					Description: "Maximum command runtime.",
 				},
 				"tty": {
@@ -216,11 +216,11 @@ func (t *execCommandTool) Declaration() *tool.Declaration {
 						"interactive commands.",
 				},
 				"yieldMs": {
-					Type:        "number",
+					Type:        "integer",
 					Description: "Alias for yield_time_ms.",
 				},
 				"timeoutSec": {
-					Type:        "number",
+					Type:        "integer",
 					Description: "Alias for timeout_sec.",
 				},
 				"pty": {
@@ -334,7 +334,7 @@ func (t *writeStdinTool) Declaration() *tool.Declaration {
 					Description: "Append a newline after chars.",
 				},
 				"yield_time_ms": {
-					Type:        "number",
+					Type:        "integer",
 					Description: "Optional wait before polling.",
 				},
 				"sessionId": {
@@ -342,7 +342,7 @@ func (t *writeStdinTool) Declaration() *tool.Declaration {
 					Description: "Alias for session_id.",
 				},
 				"yieldMs": {
-					Type:        "number",
+					Type:        "integer",
 					Description: "Alias for yield_time_ms.",
 				},
 				"submit": {

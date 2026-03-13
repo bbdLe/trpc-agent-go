@@ -124,7 +124,7 @@ func (m *manager) exec(
 		return execResult{
 			Status:    programStatusRunning,
 			SessionID: sess.id,
-			Output:    sess.tail(defaultLogTail),
+			Output:    sess.pollTail(defaultLogTail),
 		}, nil
 	}
 
@@ -163,7 +163,7 @@ func (m *manager) exec(
 		return execResult{
 			Status:    programStatusRunning,
 			SessionID: sess.id,
-			Output:    sess.tail(defaultLogTail),
+			Output:    sess.pollTail(defaultLogTail),
 		}, nil
 	}
 }
